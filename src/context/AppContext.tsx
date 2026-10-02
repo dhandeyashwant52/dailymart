@@ -9,11 +9,12 @@ import {
   deleteDoc,
   query,
   orderBy,
-  getDocs,
+  where,
   getDoc,
 } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth, testFirestoreConnection } from '../lib/firebase';
+import { marketplaceApi } from '../services/marketplaceApi';
 import {
   Shop,
   Product,
@@ -39,10 +40,8 @@ import {
 } from '../types';
 import { calculateDistanceKm, getNearbyShops, POPULAR_DELIVERY_LOCATIONS } from '../lib/geo';
 import {
-  SEED_SHOP_TEMPLATES,
   DEFAULT_BUSINESS_HOURS,
   DEFAULT_DELIVERY_CONFIG,
-  DEFAULT_CATEGORIES,
   DEFAULT_PLATFORM_SETTINGS,
 } from '../lib/seedData';
 
@@ -253,6 +252,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [sellerApplications, setSellerApplications] = useState<SellerApplication[]>([]);
   const [isVerifiedAdmin, setIsVerifiedAdmin] = useState(false);
+  const [authorizedShopIds, setAuthorizedShopIds] = useState<string[]>([]);
+  const [adminRole, setAdminRoleState] = useState<AdminRole>('SUPER_ADMIN');
   const [isBecomeSellerModalOpen, setIsBecomeSellerModalOpen] = useState(false);
   const [isSellerDetailsModalOpen, setIsSellerDetailsModalOpen] = useState(false);
 
@@ -283,25 +284,47 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Can user access seller dashboard? (Requires approved merchant role & verified shop)
   const canAccessSellerDashboard = useMemo(() => {
     if (!currentUser) return false;
-    const hasMerchantRole = currentUser.roles?.merchant === true;
-    const hasVerifiedShop = shops.some(
-      (s) =>
-        (s.ownerId === currentUserId || s.ownerId === customerId) &&
-        s.verificationStatus === 'VERIFIED'
-    );
-    return hasMerchantRole && hasVerifiedShop;
-  }, [currentUser, shops, currentUserId, customerId]);
+    return authorizedShopIds.length > 0;
+  }, [authorizedShopIds]);
+
+  useEffect(() => {
+    if (!authUserId) { setAuthorizedShopIds([]); setIsVerifiedAdmin(false); return; }
+    marketplaceApi.resolveAccess().then((access) => {
+      setAuthorizedShopIds(access.ownedShopIds);
+      setIsVerifiedAdmin(access.adminRole !== null);
+      if (access.adminRole) setAdminRoleState(access.adminRole as AdminRole);
+    }).catch(() => { setAuthorizedShopIds([]); setIsVerifiedAdmin(false); });
+  }, [authUserId]);
 
   // Active seller application if submitted
   const sellerApplication = useMemo(() => {
     return (
       sellerApplications.find(
-        (a) => a.applicantUid === currentUserId || a.applicantUid === customerId
+        (a) => a.applicantUserId === currentUserId || a.applicantUserId === customerId
       ) ||
       currentUser?.sellerApplication ||
       null
     );
   }, [sellerApplications, currentUser, currentUserId, customerId]);
+
+  const submitSellerApplication = useCallback(async (data: {
+    applicantName: string; applicantPhone: string; applicantEmail?: string; shopName: string; category: string;
+    address: string; city: string; pincode: string; deliveryRadius: number; gstin?: string;
+  }): Promise<string | null> => {
+    try {
+      const result = await marketplaceApi.submitSellerApplication({
+        businessName: data.shopName, businessType: data.category, address: data.address, city: data.city,
+        pincode: data.pincode, category: data.category, latitude: userLocation.lat, longitude: userLocation.lng,
+        phone: data.applicantPhone, documents: [],
+      });
+      return result.applicationId;
+    } catch (error) { console.error('Seller application submission failed:', error); return null; }
+  }, [userLocation]);
+
+  // Profile edits are intentionally held until the profile callable is deployed; roles are never editable here.
+  const updateCustomerProfile = useCallback(async (_data: Partial<UserProfile>): Promise<boolean> => false, []);
+  const verifyAndLoginAdmin = useCallback(async (_email: string, _password?: string): Promise<boolean> => isVerifiedAdmin, [isVerifiedAdmin]);
+  const logoutAdmin = useCallback(() => setUserRoleState('customer'), []);
 
   const setUserRole = useCallback(
     (role: 'customer' | 'shop_owner' | 'admin') => {
@@ -330,12 +353,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [canAccessSellerDashboard, isVerifiedAdmin]
   );
 
-  // Admin sub-role
-  const [adminRole, setAdminRoleState] = useState<AdminRole>('SUPER_ADMIN');
-
-  const setAdminRole = useCallback((role: AdminRole) => {
-    setAdminRoleState(role);
-  }, []);
+  // UI-only display setting. It never changes Firebase claims or permissions.
+  const setAdminRole = useCallback((_role: AdminRole) => {}, []);
 
   // CRM internal merchant notes
   const [customerNotes, setCustomerNotes] = useState<Record<string, string>>(() => {
@@ -466,166 +485,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     [adminRole]
   );
 
-  // Seed Firestore if empty
-  const seedFirestoreIfNeeded = useCallback(
-    async (centerLat: number, centerLng: number) => {
-      try {
-        const shopsSnap = await getDocs(collection(db, 'shops'));
-        if (!shopsSnap.empty) return;
-
-        console.log('Seeding initial authentic shops, categories, products, and admin entities into Firestore...');
-
-        // 1. Seed Categories
-        for (let cIdx = 0; cIdx < DEFAULT_CATEGORIES.length; cIdx++) {
-          const cat = DEFAULT_CATEGORIES[cIdx];
-          const catId = `cat_${cIdx + 1}`;
-          await setDoc(doc(db, 'categories', catId), {
-            id: catId,
-            ...cat,
-          });
-        }
-
-        // 2. Seed Platform Settings
-        await setDoc(doc(db, 'platformSettings', 'main'), DEFAULT_PLATFORM_SETTINGS);
-
-        // 3. Seed Shops & Products
-        for (let i = 0; i < SEED_SHOP_TEMPLATES.length; i++) {
-          const template = SEED_SHOP_TEMPLATES[i];
-          const shopId = `shop_${i + 1}`;
-          const ownerId = `owner_${i + 1}`;
-
-          // Make the 4th shop PENDING verification for admin approval demonstration
-          const isPendingVerification = i === 3;
-
-          const shopData: Omit<Shop, 'distanceKm'> = {
-            id: shopId,
-            name: template.name,
-            ownerId,
-            category: template.category,
-            description: template.description,
-            phone: template.phone,
-            address: template.address,
-            city: template.city,
-            pincode: template.pincode,
-            latitude: centerLat + template.offsetLat,
-            longitude: centerLng + template.offsetLng,
-            isOpen: !isPendingVerification,
-            manualOverride: null,
-            verificationStatus: isPendingVerification ? 'PENDING' : 'VERIFIED',
-            verifiedBy: isPendingVerification ? undefined : 'admin_initial',
-            verifiedAt: isPendingVerification ? undefined : new Date().toISOString(),
-            isActive: !isPendingVerification,
-            businessHours: DEFAULT_BUSINESS_HOURS,
-            deliveryConfig: {
-              ...DEFAULT_DELIVERY_CONFIG,
-              deliveryFee: template.deliveryFee,
-              deliveryRadius: template.deliveryRadius,
-            },
-            rating: template.rating,
-            totalRatings: template.totalRatings,
-            deliveryRadius: template.deliveryRadius,
-            deliveryFee: template.deliveryFee,
-            freeDeliveryAbove: 299,
-            minOrder: template.minOrder,
-            estimatedDeliveryTime: template.estimatedDeliveryTime,
-            image: template.image,
-            coverImage: template.image,
-            tags: template.tags,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-
-          await setDoc(doc(db, 'shops', shopId), shopData);
-
-          // Seed default merchant payout account
-          const initialAccount: MerchantAccount = {
-            shopId,
-            businessName: template.name,
-            ownerName: i === 0 ? 'Rahul Sharma' : i === 1 ? 'Kiran Patel' : i === 2 ? 'Ganesh Pai' : 'Vikram Malhotra',
-            phone: template.phone,
-            email: `merchant.${shopId}@dailymart.in`,
-            businessAddress: `${template.address}, ${template.city} - ${template.pincode}`,
-            gstin: `29ABCDE123${i}F1Z${i}`,
-            pan: `ABCDE123${i}F`,
-            bankAccountHolder: template.name,
-            bankName: i % 2 === 0 ? 'HDFC Bank' : 'ICICI Bank',
-            ifsc: i % 2 === 0 ? 'HDFC0001234' : 'ICIC0005678',
-            accountNumberMasked: `****${4820 + i}`,
-            status: isPendingVerification ? 'PENDING_VERIFICATION' : 'VERIFIED',
-            payoutStatus: 'ACTIVE',
-            platformCommissionRate: 5,
-            connectedAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-          await setDoc(doc(db, 'merchantAccounts', shopId), initialAccount);
-
-          // Add products for this shop
-          for (let pIdx = 0; pIdx < template.products.length; pIdx++) {
-            const p = template.products[pIdx];
-            const prodId = `prod_${shopId}_${pIdx + 1}`;
-            const prodData: Product = {
-              id: prodId,
-              shopId,
-              shopName: template.name,
-              name: p.name,
-              description: p.description,
-              category: p.category,
-              price: p.price,
-              mrp: p.mrp,
-              unit: p.unit,
-              image: p.image,
-              stockQuantity: p.stockQuantity ?? 25,
-              lowStockThreshold: p.lowStockThreshold ?? 10,
-              inStock: p.inStock,
-              isActive: true,
-              isFeatured: p.isFeatured ?? false,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            };
-            await setDoc(doc(db, 'products', prodId), prodData);
-          }
-        }
-
-        // 4. Seed Initial Sample Dispute
-        await setDoc(doc(db, 'disputes', 'disp_101'), {
-          id: 'disp_101',
-          disputeId: 'DSP-101',
-          orderId: 'DM1024',
-          orderNumber: 'DM1024',
-          customerId: 'cust_sample_1',
-          customerName: 'Rahul Sharma',
-          shopId: 'shop_1',
-          shopName: 'Shree Krishna General Store',
-          issueType: 'MISSING_ITEM',
-          description: 'One pack of Amul butter was missing from the grocery bag.',
-          amount: 58,
-          status: 'OPEN',
-          adminNotes: 'Awaiting merchant response regarding missing dairy item.',
-          createdAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-          updatedAt: new Date(Date.now() - 3600000 * 4).toISOString(),
-        });
-
-        // 5. Seed Initial Audit Log
-        await setDoc(doc(db, 'auditLogs', 'log_init'), {
-          id: 'log_init',
-          adminId: 'admin_sys',
-          adminEmail: 'admin@dailymart.in',
-          adminRole: 'SUPER_ADMIN',
-          action: 'MARKETPLACE_INITIALIZED',
-          resourceType: 'SETTINGS',
-          resourceId: 'main',
-          details: 'DailyMart marketplace configured with 12 km radius and 5% commission rate.',
-          timestamp: new Date().toISOString(),
-        });
-
-        console.log('Firestore seed completed successfully.');
-      } catch (err) {
-        console.error('Seed firestore failed:', err);
-      }
-    },
-    []
-  );
-
   // Firestore Listeners & Boot
   useEffect(() => {
     testFirestoreConnection();
@@ -635,7 +494,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       collection(db, 'shops'),
       (snapshot) => {
         if (snapshot.empty) {
-          seedFirestoreIfNeeded(userLocation.lat, userLocation.lng);
+          setIsLoadingData(false);
         } else {
           const list: Shop[] = [];
           snapshot.forEach((d) => {
@@ -687,7 +546,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // 2. Listen to products
     const unsubProducts = onSnapshot(
-      collection(db, 'products'),
+      query(collection(db, 'products'), where('isActive', '==', true), where('isAvailable', '==', true)),
       (snapshot) => {
         const list: Product[] = [];
         snapshot.forEach((d) => {
@@ -910,7 +769,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
             longitude: userLocation.lng,
             createdAt: new Date().toISOString(),
           };
-          setDoc(doc(db, 'users', currentUserId), defaultProfile, { merge: true }).catch(() => {});
           setCurrentUser(defaultProfile);
         }
       },
@@ -919,9 +777,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // 14. Auth state listener
     const unsubAuth = onAuthStateChanged(auth, (usr) => {
-      if (usr) {
-        setAuthUserId(usr.uid);
-      }
+      setAuthUserId(usr?.uid ?? null);
     });
 
     return () => {
@@ -940,7 +796,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       unsubCurrentUser();
       unsubAuth();
     };
-  }, [userLocation.lat, userLocation.lng, currentUserId, userLocation.address, seedFirestoreIfNeeded]);
+  }, [userLocation.lat, userLocation.lng, currentUserId, userLocation.address]);
 
   // Compute nearby shops within default radius
   const nearbyShops = useMemo(() => {
@@ -1092,87 +948,18 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       if (!cart.shopId || cart.items.length === 0) return null;
 
       const shop = shops.find((s) => s.id === cart.shopId);
-      const deliveryFee = shop ? shop.deliveryFee : (platformSettings.defaultDeliveryFee || 25);
-      const subtotal = cartSubtotal;
-      const discount = 0;
-      const totalAmount = subtotal + deliveryFee - discount;
-
-      const orderNumber = 'DM' + Math.floor(1000 + Math.random() * 9000);
       const fullAddress = orderData.landmark
         ? `${orderData.deliveryAddress} (Near ${orderData.landmark})`
         : orderData.deliveryAddress;
-
-      const paymentStatus = orderData.paymentMethod === 'ONLINE' ? 'PAID' : 'PENDING';
-
-      const newOrderPayload: Omit<Order, 'id'> = {
-        orderId: orderNumber,
-        customerId,
-        customerName: orderData.customerName,
-        customerPhone: orderData.customerPhone,
-        deliveryAddress: fullAddress,
-        customerLatitude: userLocation.lat,
-        customerLongitude: userLocation.lng,
-        shopId: cart.shopId,
-        shopName: cart.shopName || shop?.name || 'Local Grocery Store',
-        shopOwnerId: shop?.ownerId || 'owner_1',
-        items: cart.items.map((i) => ({
-          productId: i.product.id,
-          name: i.product.name,
-          price: i.product.price,
-          quantity: i.quantity,
-          unit: i.product.unit,
-          image: i.product.image,
-          subtotal: i.product.price * i.quantity,
-        })),
-        subtotal,
-        deliveryFee,
-        discount,
-        totalAmount,
-        paymentMethod: orderData.paymentMethod,
-        paymentStatus,
-        orderStatus: 'PENDING' as OrderStatus,
-        estimatedDeliveryTime: shop?.estimatedDeliveryTime || '25–35 min',
-        notes: orderData.notes || '',
-        inventoryDeducted: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
       try {
-        const docRef = await addDoc(collection(db, 'orders'), newOrderPayload);
-
-        // Calculate Central Commission
-        const commRate = (platformSettings.defaultCommissionRate || 5) / 100;
-        const platformFee = Math.round(totalAmount * commRate);
-        const merchantAmount = totalAmount - platformFee;
-
-        await addDoc(collection(db, 'payments'), {
-          orderId: orderNumber,
-          shopId: cart.shopId,
-          customerId,
-          customerName: orderData.customerName,
-          amount: totalAmount,
-          paymentMethod: orderData.paymentMethod,
-          paymentStatus,
-          platformFee,
-          merchantAmount,
-          payoutStatus: orderData.paymentMethod === 'ONLINE' ? 'PENDING' : 'PENDING_COLLECTION',
-          createdAt: new Date().toISOString(),
+        const response = await marketplaceApi.createOrder({
+          idempotencyKey: crypto.randomUUID(), shopId: cart.shopId,
+          items: cart.items.map((item) => ({ productId: item.product.id, quantity: item.quantity })),
+          deliveryAddress: fullAddress, phone: orderData.customerPhone,
+          paymentMethod: orderData.paymentMethod, notes: orderData.notes,
         });
-
-        // Push in-app notification to merchant
-        await addDoc(collection(db, 'notifications'), {
-          shopId: cart.shopId,
-          type: 'NEW_ORDER',
-          title: `New order #${orderNumber} received`,
-          message: `${orderData.customerName} placed an order for ₹${totalAmount} (${cart.items.length} items)`,
-          orderId: docRef.id,
-          isRead: false,
-          createdAt: new Date().toISOString(),
-        });
-
         clearCart();
-        return docRef.id;
+        return response.orderId;
       } catch (err) {
         console.error('Error placing order:', err);
         return null;
@@ -1182,10 +969,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   // Shop Owner Flow
-  const shopOwnerShop = useMemo(() => {
-    if (shops.length === 0) return null;
-    return shops[0];
-  }, [shops]);
+  const shopOwnerShop = useMemo(() => shops.find((shop) => authorizedShopIds.includes(shop.id)) || null, [shops, authorizedShopIds]);
 
   const shopOwnerOrders = useMemo(() => {
     if (!shopOwnerShop) return [];
@@ -1272,54 +1056,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const order = orders.find((o) => o.id === orderId);
         if (!order) return false;
 
-        const updateData: Record<string, any> = {
-          orderStatus: status,
-          updatedAt: new Date().toISOString(),
-        };
-
-        if (reason) {
-          if (status === 'REJECTED') updateData.rejectionReason = reason;
-          if (status === 'CANCELLED') updateData.cancellationReason = reason;
-        }
-
-        if (status === 'SHOP_ACCEPTED' && !order.inventoryDeducted) {
-          for (const item of order.items) {
-            const product = products.find((p) => p.id === item.productId);
-            if (product) {
-              const currentStock = product.stockQuantity ?? 20;
-              const newStock = Math.max(0, currentStock - item.quantity);
-              const inStock = newStock > 0;
-
-              await updateDoc(doc(db, 'products', product.id), {
-                stockQuantity: newStock,
-                inStock,
-                updatedAt: new Date().toISOString(),
-              });
-
-              if (newStock <= (product.lowStockThreshold ?? 10)) {
-                await addDoc(collection(db, 'notifications'), {
-                  shopId: order.shopId,
-                  type: 'LOW_STOCK',
-                  title: `Low stock alert: ${product.name}`,
-                  message: `Only ${newStock} ${product.unit} remaining in stock. Consider reordering.`,
-                  productId: product.id,
-                  isRead: false,
-                  createdAt: new Date().toISOString(),
-                });
-              }
-            }
-          }
-          updateData.inventoryDeducted = true;
-        }
-
-        await updateDoc(doc(db, 'orders', orderId), updateData);
+        await marketplaceApi.transitionOrder({ orderId, nextStatus: status, reason });
         return true;
       } catch (e) {
         console.error('Error updating order status:', e);
         return false;
       }
     },
-    [orders, products]
+    [orders]
   );
 
   // Mark COD collected
@@ -1329,25 +1073,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const order = orders.find((o) => o.id === orderId);
         if (!order) return false;
 
-        await updateDoc(doc(db, 'orders', orderId), {
-          paymentStatus: 'COLLECTED',
-          updatedAt: new Date().toISOString(),
-        });
-
-        const payRecord = payments.find((p) => p.orderId === order.orderId);
-        if (payRecord) {
-          await updateDoc(doc(db, 'payments', payRecord.id), {
-            paymentStatus: 'COLLECTED',
-            payoutStatus: 'PAID',
-          });
-        }
+        await marketplaceApi.markCodCollected({ orderId });
         return true;
       } catch (e) {
         console.error('Error marking COD payment collected:', e);
         return false;
       }
     },
-    [orders, payments]
+    [orders]
   );
 
   // Merchant Shop Actions
@@ -1429,12 +1162,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Products CRUD
   const addProduct = useCallback(async (productData: Omit<Product, 'id'>): Promise<string | null> => {
     try {
-      const docRef = await addDoc(collection(db, 'products'), {
-        ...productData,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      });
-      return docRef.id;
+      const response = await marketplaceApi.manageProduct({ action: 'CREATE', shopId: productData.shopId, product: productData });
+      return response.productId;
     } catch (e) {
       console.error(e);
       return null;
@@ -1443,46 +1172,41 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const updateProduct = useCallback(async (productId: string, data: Partial<Product>): Promise<boolean> => {
     try {
-      await updateDoc(doc(db, 'products', productId), {
-        ...data,
-        updatedAt: new Date().toISOString(),
-      });
+      const existing = products.find((product) => product.id === productId);
+      if (!existing) return false;
+      await marketplaceApi.manageProduct({ action: 'UPDATE', shopId: existing.shopId, productId, product: data });
       return true;
     } catch (e) {
       console.error(e);
       return false;
     }
-  }, []);
+  }, [products]);
 
   const deleteProduct = useCallback(async (productId: string): Promise<boolean> => {
     try {
-      await deleteDoc(doc(db, 'products', productId));
+      const existing = products.find((product) => product.id === productId);
+      if (!existing) return false;
+      await marketplaceApi.manageProduct({ action: 'DEACTIVATE', shopId: existing.shopId, productId });
       return true;
     } catch (e) {
       console.error(e);
       return false;
     }
-  }, []);
+  }, [products]);
 
   const updateProductStock = useCallback(
     async (productId: string, stockQuantity: number, lowStockThreshold?: number): Promise<boolean> => {
       try {
-        const updateData: Record<string, any> = {
-          stockQuantity,
-          inStock: stockQuantity > 0,
-          updatedAt: new Date().toISOString(),
-        };
-        if (lowStockThreshold !== undefined) {
-          updateData.lowStockThreshold = lowStockThreshold;
-        }
-        await updateDoc(doc(db, 'products', productId), updateData);
+        const existing = products.find((product) => product.id === productId);
+        if (!existing) return false;
+        await marketplaceApi.manageProduct({ action: 'ADJUST_STOCK', shopId: existing.shopId, productId, product: { stockQuantity, ...(lowStockThreshold === undefined ? {} : { lowStockThreshold }) } });
         return true;
       } catch (e) {
         console.error(e);
         return false;
       }
     },
-    []
+    [products]
   );
 
   const updateMerchantAccount = useCallback(
@@ -1960,6 +1684,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         customerOrders,
         activeOrder,
         createOrder,
+        currentUser,
+        currentUserId,
+        updateCustomerProfile,
+        isVerifiedAdmin,
+        canAccessSellerDashboard,
+        verifyAndLoginAdmin,
+        logoutAdmin,
+        sellerApplication,
+        submitSellerApplication,
+        isBecomeSellerModalOpen,
+        setIsBecomeSellerModalOpen,
+        isSellerDetailsModalOpen,
+        setIsSellerDetailsModalOpen,
         userRole,
         setUserRole,
         adminRole,

@@ -1,97 +1,44 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
-    function isAuthenticated() {
-      return request.auth != null;
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function admin() { return signedIn() && request.auth.token.platformRole in ['SUPER_ADMIN', 'OPERATIONS_ADMIN', 'FINANCE_ADMIN', 'SUPPORT_ADMIN']; }
+    function operationsAdmin() { return signedIn() && request.auth.token.platformRole in ['SUPER_ADMIN', 'OPERATIONS_ADMIN']; }
+    function financeAdmin() { return signedIn() && request.auth.token.platformRole in ['SUPER_ADMIN', 'FINANCE_ADMIN']; }
+    function supportAdmin() { return signedIn() && request.auth.token.platformRole in ['SUPER_ADMIN', 'SUPPORT_ADMIN']; }
+    function member(shopId) {
+      return signedIn() && exists(/databases/$(database)/documents/shopMembers/$(request.auth.uid + '_' + shopId))
+        && get(/databases/$(database)/documents/shopMembers/$(request.auth.uid + '_' + shopId)).data.status == 'ACTIVE';
+    }
+    function shopOwner(shopId) { return member(shopId) && get(/databases/$(database)/documents/shopMembers/$(request.auth.uid + '_' + shopId)).data.role == 'SHOP_OWNER'; }
+    function shopPermission(shopId, permission) {
+      return shopOwner(shopId) || (member(shopId) && permission in get(/databases/$(database)/documents/shopMembers/$(request.auth.uid + '_' + shopId)).data.permissions);
     }
 
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
-    }
+    // Public marketplace catalogue is readable; mutations go through trusted Functions.
+    match /shops/{shopId} { allow read: if resource.data.status == 'ACTIVE' && resource.data.operationalStatus != 'CLOSED' || member(shopId) || admin(); allow write: if false; }
+    match /products/{productId} { allow read: if (resource.data.isActive == true && resource.data.isAvailable == true) || member(resource.data.shopId) || admin(); allow write: if false; }
+    match /categories/{categoryId} { allow read: if resource.data.isActive == true || admin(); allow write: if false; }
 
-    // Test connection document
-    match /test/{docId} {
-      allow read, write: if true;
-    }
+    match /users/{uid} { allow get: if isSelf(uid) || admin(); allow list: if admin(); allow create, update, delete: if false; }
+    match /shopMembers/{memberId} { allow get: if signedIn() && (resource.data.userId == request.auth.uid || member(resource.data.shopId) || admin()); allow list: if false; allow write: if false; }
+    match /sellerApplications/{id} { allow get: if signedIn() && (resource.data.applicantUserId == request.auth.uid || operationsAdmin()); allow list: if operationsAdmin(); allow write: if false; }
+    match /orders/{id} { allow get: if signedIn() && (resource.data.customerId == request.auth.uid || member(resource.data.shopId) || admin()); allow list: if false; allow write: if false; }
+    match /orderPayments/{id} { allow get: if signedIn() && (resource.data.customerId == request.auth.uid || member(resource.data.shopId) || financeAdmin()); allow list: if false; allow write: if false; }
+    match /deliveryAssignments/{id} { allow get: if signedIn() && (resource.data.deliveryStaffId == request.auth.uid || shopPermission(resource.data.shopId, 'DELIVERY_MANAGE') || admin()); allow list: if false; allow write: if false; }
+    match /supportTickets/{id} { allow get: if signedIn() && (resource.data.customerId == request.auth.uid || member(resource.data.shopId) || supportAdmin()); allow list: if false; allow write: if false; }
+    match /supportMessages/{id} { allow get: if signedIn() && (resource.data.customerId == request.auth.uid || member(resource.data.shopId) || supportAdmin()); allow list: if false; allow write: if false; }
+    match /notifications/{id} { allow get, update: if signedIn() && resource.data.userId == request.auth.uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt']); allow list: if false; allow create, delete: if false; }
+    match /merchantSubscriptions/{id} { allow get: if signedIn() && (member(resource.data.shopId) || financeAdmin()); allow list: if false; allow write: if false; }
+    match /merchantAccounts/{id} { allow get: if member(id) || financeAdmin(); allow write: if false; }
+    match /payouts/{id} { allow get: if member(resource.data.shopId) || financeAdmin(); allow list, write: if false; }
+    match /refunds/{id} { allow get: if signedIn() && (resource.data.customerId == request.auth.uid || member(resource.data.shopId) || financeAdmin()); allow list, write: if false; }
+    match /auditLogs/{id} { allow read: if admin(); allow write: if false; }
+    match /platformSettings/{id} { allow read: if signedIn(); allow write: if false; }
+    match /adminUsers/{id} { allow read: if admin(); allow write: if false; }
 
-    // Users
-    match /users/{userId} {
-      allow read: if true;
-      allow write: if true;
-    }
-
-    // Seller Applications
-    match /sellerApplications/{appId} {
-      allow read: if true;
-      allow create: if true;
-      allow update, delete: if true;
-    }
-
-    // Admins
-    match /admins/{adminId} {
-      allow read: if true;
-      allow write: if true;
-    }
-
-    // Shops
-    match /shops/{shopId} {
-      allow read: if true;
-      allow create, update, delete: if true;
-    }
-
-    // Products
-    match /products/{productId} {
-      allow read: if true;
-      allow create, update, delete: if true;
-    }
-
-    // Orders
-    match /orders/{orderId} {
-      allow read: if true;
-      allow create: if true;
-      allow update: if true;
-      allow delete: if false;
-    }
-
-    // Merchant Accounts
-    match /merchantAccounts/{shopId} {
-      allow read, write: if true;
-    }
-
-    // Payments
-    match /payments/{paymentId} {
-      allow read, write: if true;
-    }
-
-    // Notifications
-    match /notifications/{notificationId} {
-      allow read, write: if true;
-    }
-
-    // Categories
-    match /categories/{categoryId} {
-      allow read, write: if true;
-    }
-
-    // Disputes
-    match /disputes/{disputeId} {
-      allow read, write: if true;
-    }
-
-    // Audit Logs
-    match /auditLogs/{logId} {
-      allow read, write: if true;
-    }
-
-    // Platform Settings
-    match /platformSettings/{settingId} {
-      allow read, write: if true;
-    }
-
-    // Admin Users
-    match /adminUsers/{adminId} {
-      allow read, write: if true;
-    }
+    // Legacy financial/admin collections are backend-only during migration.
+    match /{document=**} { allow read, write: if false; }
   }
 }

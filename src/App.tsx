@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
 import { AppProvider, useApp } from './context/AppContext';
 import { Header } from './components/Header';
 import { BottomNav } from './components/BottomNav';
@@ -14,6 +15,8 @@ import { OrdersListView } from './components/views/OrdersListView';
 import { ProfileView } from './components/views/ProfileView';
 import { ShopOwnerDashboard } from './components/views/ShopOwnerDashboard';
 import { AdminDashboard } from './components/views/AdminDashboard';
+import { AuthenticationScreen } from './components/auth/AuthenticationScreen';
+import { auth } from './lib/firebase';
 
 const MainContent: React.FC = () => {
   const {
@@ -67,6 +70,10 @@ const MainContent: React.FC = () => {
 };
 
 export default function App() {
+  const [authenticated, setAuthenticated] = useState<boolean | null>(null);
+  useEffect(() => onAuthStateChanged(auth, (user) => setAuthenticated(!!user)), []);
+  if (authenticated === null) return null;
+  if (!authenticated) return <AuthenticationScreen />;
   return (
     <AppProvider>
       <MainContent />

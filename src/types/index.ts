@@ -107,12 +107,19 @@ export interface Cart {
 
 export type OrderStatus =
   | 'PENDING'
+  | 'CART'
+  | 'CHECKOUT'
+  | 'ORDER_PLACED'
   | 'SHOP_ACCEPTED'
   | 'PREPARING'
+  | 'READY_FOR_PICKUP'
+  | 'ASSIGNED_TO_DELIVERY'
+  | 'PICKED_UP'
   | 'OUT_FOR_DELIVERY'
   | 'DELIVERED'
   | 'REJECTED'
-  | 'CANCELLED';
+  | 'CANCELLED'
+  | 'DELIVERY_FAILED';
 
 export interface OrderItem {
   productId: string;
@@ -231,6 +238,7 @@ export interface SellerApplication {
   id: string;
   applicationId: string; // e.g. "DM-REG-1048"
   applicantUid: string;
+  applicantUserId?: string;
   applicantName: string;
   applicantPhone: string;
   applicantEmail?: string;
